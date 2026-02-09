@@ -1,683 +1,1255 @@
-// ============================================
-// 設定
-// ============================================
-let CONFIG = {
-  WORK_MINUTES: 20,
-  BREAK_MINUTES: 5,
-};
+(() => {
+  'use strict';
 
-// ============================================
-// 状態管理
-// ============================================
-let state = {
-  odId: null, // 自分のPeerID (Firebaseのキーとしても使用)
-  nickname: '',
-  roomId: null, // 追加: ルームID
-  isHost: false,
-  participants: new Map(),
-  isBreak: false,
-  remainingSeconds: CONFIG.WORK_MINUTES * 60,
-  isPaused: false,
-  isMuted: false,
-  currentCycle: 0,
-  peer: null,
-  connections: new Map(), // PeerJSのコネクション管理
-  localStream: null,
-  audioContext: null,
-  analyser: null,
-  firebaseApp: null,
-  database: null,
-  roomRef: null,
-};
+  // -----------------------------
+  // Constants
+  // -----------------------------
+  const STORAGE_KEYS = {
+    firebaseConfig: 'st_firebase_config_v2',
+    nickname: 'st_nickname_v2',
+    uid: 'st_uid_v2',
+  };
 
-// ============================================
-// 初期化チェック (ページロード時)
-// ============================================
-window.addEventListener('DOMContentLoaded', () => {
-  if (loadFirebaseConfig()) {
-    // URLからルームIDがある場合などはinitializeFirebase内で処理
-  }
-});
+  const DEFAULT_SETTINGS = {
+    workSec: 25 * 60,
+    breakSec: 5 * 60,
+  };
 
-// ============================================
-// ユーティリティ
-// ============================================
-function generateId(length = 6) {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  return Array.from({ length }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
-}
+  const ROOM_CODE_LEN = 6;
+  const HEARTBEAT_MS = 10_000;
+  const STALE_MS = 35_000;
 
-function formatTime(seconds) {
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-}
+  // -----------------------------
+  // State
+  // -----------------------------
+  const state = {
+    db: null,
+    app: null,
+    globalDbListeners: [],
+    roomDbListeners: [],
 
-function showNotification(message, isError = false) {
-  const el = document.getElementById('notification');
-  el.textContent = message;
-  el.classList.toggle('error', isError);
-  el.classList.add('show');
-  setTimeout(() => el.classList.remove('show'), 3000);
-}
+    uid: getOrCreateUid(),
+    nickname: '',
 
-// ============================================
-// Firebase設定
-// ============================================
-function saveFirebaseConfig() {
-  const input = document.getElementById('firebaseConfigInput').value.trim();
-  
-  try {
-    // JSON形式をパース
-    let config;
-    if (input.startsWith('{')) {
-      config = JSON.parse(input);
-    } else {
-      const jsonStr = input
-        .replace(/(['"])?([a-zA-Z0-9_]+)(['"])?:/g, '"$2":')
-        .replace(/'/g, '"');
-      config = JSON.parse(jsonStr);
-    }
+    roomId: null,
+    roomRef: null,
+    participantRef: null,
 
-    if (!config.apiKey || !config.databaseURL || !config.projectId) {
-      throw new Error('必須フィールドが不足しています');
-    }
+    participants: new Map(),
+    hostId: null,
+    isHost: false,
 
-    localStorage.setItem('firebaseConfig', JSON.stringify(config));
-    initializeFirebase(config);
-    showNotification('Firebase設定を保存しました');
-    
-  } catch (e) {
-    console.error('Config parse error:', e);
-    showNotification('設定の形式が正しくありません', true);
-  }
-}
+    settings: { ...DEFAULT_SETTINGS },
+    timer: {
+      phase: 'work',
+      paused: true,
+      pausedRemaining: DEFAULT_SETTINGS.workSec,
+      phaseStartAt: Date.now(),
+      cycle: 0,
+      version: 0,
+    },
 
-function loadFirebaseConfig() {
-  const saved = localStorage.getItem('firebaseConfig');
-  if (saved) {
+    serverOffsetMs: 0,
+    uiTicker: null,
+    heartbeatTicker: null,
+    staleTicker: null,
+    isSwitchingPhase: false,
+
+    // Voice
+    peer: null,
+    peerReady: false,
+    localStream: null,
+    remoteCalls: new Map(),
+    voiceEnabled: false,
+    isMuted: false,
+    audioCtx: null,
+    analyser: null,
+    micAnimationFrame: null,
+  };
+
+  // -----------------------------
+  // DOM helpers
+  // -----------------------------
+  const $ = (id) => document.getElementById(id);
+
+  const els = {
+    setupScreen: null,
+    lobbyScreen: null,
+    roomScreen: null,
+
+    firebaseConfigInput: null,
+    saveConfigBtn: null,
+
+    connDot: null,
+    connText: null,
+
+    nicknameInput: null,
+    roomCodeInput: null,
+    joinBtn: null,
+    createBtn: null,
+    resetConfigBtn: null,
+
+    phaseBadge: null,
+    roomTitle: null,
+    timerDisplay: null,
+    timerLabel: null,
+    cycleText: null,
+    ring: null,
+
+    startPauseBtn: null,
+    skipBtn: null,
+    leaveBtn: null,
+
+    copyCodeBtn: null,
+    copyInviteBtn: null,
+
+    voiceToggleBtn: null,
+    muteBtn: null,
+    voiceHelp: null,
+    voiceStatePill: null,
+    micBars: null,
+
+    participantCount: null,
+    participantList: null,
+
+    settingsModal: null,
+    openSettingsBtn: null,
+    closeSettingsBtn: null,
+    saveSettingsBtn: null,
+    workMinInput: null,
+    breakMinInput: null,
+
+    toast: null,
+  };
+
+  // -----------------------------
+  // Boot
+  // -----------------------------
+  window.addEventListener('DOMContentLoaded', async () => {
+    bindDom();
+    bindUiEvents();
+
+    const config = loadFirebaseConfig();
+
     try {
-      const config = JSON.parse(saved);
-      initializeFirebase(config);
-      return true;
-    } catch (e) {
-      console.error('Failed to load config:', e);
+      await initFirebase(config);
+      showScreen('lobby');
+      hydrateLobbyInputs();
+
+      const roomFromQuery = getRoomFromQuery();
+      if (roomFromQuery && els.roomCodeInput) {
+        els.roomCodeInput.value = roomFromQuery;
+      }
+    } catch (err) {
+      console.error(err);
+      showScreen('lobby');
+      disableLobbyButtons(true);
+      if (els.connDot) els.connDot.style.background = '#f87171';
+      if (els.connText) {
+        els.connText.textContent = '初期化エラー: 管理者がFirebase設定を完了していません';
+      }
+      toast('アプリ初期化に失敗。運営者に設定不備（config.js または Firebase Hosting init.js）を確認してもらってください。', true);
+    }
+  });
+
+  function bindDom() {
+    Object.keys(els).forEach((key) => {
+      els[key] = $(key);
+    });
+  }
+
+  function bindUiEvents() {
+    on(els.saveConfigBtn, 'click', handleSaveConfig);
+
+    on(els.joinBtn, 'click', handleJoin);
+    on(els.createBtn, 'click', handleCreate);
+    on(els.resetConfigBtn, 'click', handleResetConfig);
+
+    on(els.roomCodeInput, 'input', () => {
+      els.roomCodeInput.value = normalizeRoomCode(els.roomCodeInput.value);
+    });
+
+    on(els.startPauseBtn, 'click', handleStartPause);
+    on(els.skipBtn, 'click', handleSkip);
+    on(els.leaveBtn, 'click', leaveRoom);
+
+    on(els.copyCodeBtn, 'click', copyRoomCode);
+    on(els.copyInviteBtn, 'click', copyInviteLink);
+
+    on(els.voiceToggleBtn, 'click', toggleVoice);
+    on(els.muteBtn, 'click', toggleMute);
+
+    on(els.openSettingsBtn, 'click', openSettingsModal);
+    on(els.closeSettingsBtn, 'click', closeSettingsModal);
+    on(els.saveSettingsBtn, 'click', saveSettings);
+    on(els.settingsModal, 'click', (e) => {
+      if (e.target === els.settingsModal) closeSettingsModal();
+    });
+  }
+
+  // -----------------------------
+  // Firebase setup
+  // -----------------------------
+  function loadFirebaseConfig() {
+    // 1) 静的ファイル(config.js)で注入
+    if (window.STUDY_TOGETHER_FIREBASE_CONFIG) {
+      return window.STUDY_TOGETHER_FIREBASE_CONFIG;
+    }
+
+    // 2) Firebase Hosting の自動初期化 (/__/firebase/init.js)
+    if (window.firebase?.apps?.length) {
+      return window.firebase.app().options || null;
+    }
+
+    // 3) レガシー互換（過去バージョンで localStorage に保存済みの場合）
+    const raw = localStorage.getItem(STORAGE_KEYS.firebaseConfig);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
     }
   }
-  return false;
-}
 
-function resetConfig() {
-  if (confirm('Firebase設定をリセットしますか？')) {
-    localStorage.removeItem('firebaseConfig');
-    location.reload();
-  }
-}
+  async function initFirebase(config) {
+    if (!window.firebase) {
+      throw new Error('Firebase SDK not loaded');
+    }
 
-function initializeFirebase(config) {
-  try {
     if (!firebase.apps.length) {
-      state.firebaseApp = firebase.initializeApp(config);
+      if (!config) throw new Error('Missing firebase config');
+      state.app = firebase.initializeApp(config);
     } else {
-      state.firebaseApp = firebase.app();
+      state.app = firebase.app();
     }
-    state.database = firebase.database();
-    
-    document.getElementById('setupScreen').classList.add('hidden');
-    document.getElementById('joinScreen').classList.add('active');
-    
-    updateConnectionStatus('connected', 'Firebase に接続済み');
-    
-    const params = new URLSearchParams(window.location.search);
-    const roomIdFromUrl = params.get('room');
-    if (roomIdFromUrl) {
-      document.getElementById('roomId').value = roomIdFromUrl;
+
+    state.db = firebase.database();
+
+    // 接続状態
+    const connectedRef = state.db.ref('.info/connected');
+    onDb(connectedRef, 'value', (snap) => {
+      const connected = !!snap.val();
+      els.connDot.style.background = connected ? '#34d399' : '#94a3b8';
+      els.connText.textContent = connected ? 'オンライン' : 'オフライン';
+    }, 'global');
+
+    // サーバ時刻オフセット（同期タイマーに必須）
+    const offsetRef = state.db.ref('.info/serverTimeOffset');
+    onDb(offsetRef, 'value', (snap) => {
+      state.serverOffsetMs = Number(snap.val() || 0);
+    }, 'global');
+  }
+
+  function handleSaveConfig() {
+    const raw = els.firebaseConfigInput.value.trim();
+    if (!raw) {
+      toast('firebaseConfig が空です。人生もたまに空白だけど、ここは埋めよう。', true);
+      return;
     }
-    
-  } catch (e) {
-    console.error('Firebase init error:', e);
-    updateConnectionStatus('error', '接続エラー');
-    showNotification('Firebase接続に失敗しました', true);
-  }
-}
 
-function updateConnectionStatus(status, text) {
-  const dot = document.getElementById('connectionDot');
-  const textEl = document.getElementById('connectionText');
-  
-  dot.className = 'connection-dot';
-  if (status === 'connected') dot.classList.add('connected');
-  if (status === 'error') dot.classList.add('error');
-  
-  textEl.textContent = text;
-}
-
-// ============================================
-// UI更新
-// ============================================
-function updateTimerDisplay() {
-  document.getElementById('timerDisplay').textContent = formatTime(state.remainingSeconds);
-  
-  const totalSeconds = state.isBreak ? CONFIG.BREAK_MINUTES * 60 : CONFIG.WORK_MINUTES * 60;
-  // 0除算防止
-  const progress = totalSeconds > 0 ? state.remainingSeconds / totalSeconds : 0;
-  
-  const circumference = 2 * Math.PI * 130;
-  const offset = circumference * (1 - progress);
-  
-  const circle = document.getElementById('progressCircle');
-  circle.style.strokeDashoffset = offset;
-  circle.classList.toggle('work', !state.isBreak);
-  
-  const badge = document.getElementById('statusBadge');
-  badge.textContent = state.isBreak ? '☕ 休憩中' : '🎯 作業中';
-  badge.className = `status-badge ${state.isBreak ? 'status-break' : 'status-work'}`;
-  
-  document.getElementById('timerLabel').textContent = state.isBreak ? '休憩タイム' : '集中タイム';
-}
-
-function updateCycleIndicator() {
-  const container = document.getElementById('cycleIndicator');
-  container.innerHTML = '';
-  
-  for (let i = 0; i < 4; i++) {
-    const dot = document.createElement('div');
-    dot.className = 'cycle-dot';
-    if (i < state.currentCycle) dot.classList.add('completed');
-    if (i === state.currentCycle) dot.classList.add('current');
-    container.appendChild(dot);
-  }
-}
-
-function updateParticipantList() {
-  const list = document.getElementById('participantList');
-  list.innerHTML = '';
-  
-  state.participants.forEach((data, pId) => {
-    const div = document.createElement('div');
-    div.className = 'participant';
-    div.id = `participant-${pId}`;
-    
-    // 最終更新から10秒以内ならオンラインとみなす
-    const isOnline = data.lastSeen && (Date.now() - data.lastSeen < 15000);
-    
-    div.innerHTML = `
-      <span class="participant-dot ${isOnline ? '' : 'offline'}"></span>
-      <span>${data.nickname}${pId === state.odId ? '（自分）' : ''}</span>
-    `;
-    list.appendChild(div);
-  });
-  
-  document.getElementById('participantCount').textContent = state.participants.size;
-}
-
-function updateCallUI() {
-  const callUI = document.getElementById('callUI');
-  callUI.classList.toggle('active', state.isBreak);
-  
-  // 休憩に入ったら通話開始、作業に戻ったら終了
-  // (実際のストリーム制御は setupFirebaseListeners で呼ばれる startCall/endCall で行う)
-}
-
-function showMainScreen() {
-  document.getElementById('joinScreen').classList.remove('active');
-  document.getElementById('mainScreen').classList.add('active');
-  document.getElementById('roomCodeDisplay').textContent = state.roomId;
-}
-
-// ============================================
-// Firebase ルーム管理
-// ============================================
-async function createRoom() {
-  const nickname = document.getElementById('nickname').value.trim();
-  if (!nickname) {
-    showNotification('ニックネームを入力してください', true);
-    return;
+    try {
+      const cfg = JSON.parse(raw);
+      localStorage.setItem(STORAGE_KEYS.firebaseConfig, JSON.stringify(cfg));
+      location.reload();
+    } catch {
+      toast('JSONが壊れてる。カンマとカッコを見直して。', true);
+    }
   }
 
-  state.nickname = nickname;
-  state.roomId = generateId();
-  state.odId = generateId(10); // PeerIDとしても使う
-  state.isHost = true;
-
-  await initializeRoom();
-}
-
-async function joinRoom() {
-  const nickname = document.getElementById('nickname').value.trim();
-  const roomId = document.getElementById('roomId').value.trim().toUpperCase();
-
-  if (!nickname) {
-    showNotification('ニックネームを入力してください', true);
-    return;
-  }
-  if (!roomId) {
-    showNotification('ルームIDを入力してください', true);
-    return;
+  function handleResetConfig() {
+    localStorage.removeItem(STORAGE_KEYS.firebaseConfig);
+    toast('Firebase設定を削除しました。ページを再読み込みします。');
+    setTimeout(() => location.reload(), 500);
   }
 
-  // ルームの存在確認
-  const roomSnapshot = await state.database.ref(`rooms/${roomId}`).once('value');
-  if (!roomSnapshot.exists()) {
-    showNotification('ルームが見つかりません', true);
-    return;
+  // -----------------------------
+  // Lobby actions
+  // -----------------------------
+  function hydrateLobbyInputs() {
+    const savedNick = localStorage.getItem(STORAGE_KEYS.nickname) || '';
+    if (savedNick) els.nicknameInput.value = savedNick;
   }
 
-  state.nickname = nickname;
-  state.roomId = roomId;
-  state.odId = generateId(10);
-  state.isHost = false;
+  async function handleCreate() {
+    const nickname = sanitizeNickname(els.nicknameInput.value);
+    if (!nickname) {
+      toast('ニックネームは2文字以上で頼む。', true);
+      return;
+    }
 
-  await initializeRoom();
-}
+    disableLobbyButtons(true);
+    try {
+      const roomId = await createRoomWithRetries();
+      await enterRoom(roomId, nickname, { justCreated: true });
+    } catch (err) {
+      console.error(err);
+      toast('ルーム作成に失敗。通信か設定を見直して。', true);
+    } finally {
+      disableLobbyButtons(false);
+    }
+  }
 
-async function initializeRoom() {
-  state.roomRef = state.database.ref(`rooms/${state.roomId}`);
+  async function handleJoin() {
+    const nickname = sanitizeNickname(els.nicknameInput.value);
+    const roomId = normalizeRoomCode(els.roomCodeInput.value || getRoomFromQuery() || '');
 
-  if (state.isHost) {
-    await state.roomRef.set({
-      createdAt: firebase.database.ServerValue.TIMESTAMP,
-      hostId: state.odId,
-      timer: {
-        remainingSeconds: CONFIG.WORK_MINUTES * 60,
-        isBreak: false,
-        isPaused: false,
-        lastUpdate: firebase.database.ServerValue.TIMESTAMP,
-        currentCycle: 0,
-      },
-      settings: {
-        workMinutes: CONFIG.WORK_MINUTES,
-        breakMinutes: CONFIG.BREAK_MINUTES,
+    if (!nickname) {
+      toast('ニックネームは2文字以上で頼む。', true);
+      return;
+    }
+    if (!roomId) {
+      toast('ルームコードが必要。超能力参加は未実装。', true);
+      return;
+    }
+
+    disableLobbyButtons(true);
+    try {
+      const exists = await roomExists(roomId);
+      if (!exists) {
+        toast(`ルーム ${roomId} は見つかりません。`, true);
+        return;
       }
-    });
-  } else {
-    // 設定を取得
-    const settingsSnapshot = await state.roomRef.child('settings').once('value');
-    const settings = settingsSnapshot.val();
-    if (settings) {
-      CONFIG.WORK_MINUTES = settings.workMinutes;
-      CONFIG.BREAK_MINUTES = settings.breakMinutes;
+
+      await enterRoom(roomId, nickname, { justCreated: false });
+    } catch (err) {
+      console.error(err);
+      toast('ルーム参加に失敗。通信を見直して。', true);
+    } finally {
+      disableLobbyButtons(false);
     }
   }
 
-  // 自分を参加者として登録
-  const participantRef = state.roomRef.child(`participants/${state.odId}`);
-  await participantRef.set({
-    nickname: state.nickname,
-    joinedAt: firebase.database.ServerValue.TIMESTAMP,
-    lastSeen: firebase.database.ServerValue.TIMESTAMP,
-    peerId: state.odId // PeerIDを保存して他人が接続できるようにする
-  });
+  async function createRoomWithRetries(maxTry = 8) {
+    for (let i = 0; i < maxTry; i += 1) {
+      const roomId = generateRoomCode();
+      const ref = state.db.ref(`rooms/${roomId}`);
+      const now = nowServerMs();
 
-  // 切断時に削除
-  participantRef.onDisconnect().remove();
+      const result = await ref.transaction((current) => {
+        if (current !== null) return undefined;
+        return {
+          meta: {
+            createdAt: now,
+            hostId: state.uid,
+          },
+          settings: { ...DEFAULT_SETTINGS },
+          timer: {
+            phase: 'work',
+            paused: true,
+            pausedRemaining: DEFAULT_SETTINGS.workSec,
+            phaseStartAt: now,
+            cycle: 0,
+            version: 1,
+          },
+          participants: {},
+        };
+      });
 
-  // 定期的にlastSeenを更新
-  setInterval(() => {
-    if (state.roomRef) {
-      participantRef.update({ lastSeen: firebase.database.ServerValue.TIMESTAMP });
-    }
-  }, 5000);
-
-  // PeerJSを初期化 (Firebase初期化後に呼び出し)
-  await initializePeer();
-
-  // リスナーを設定
-  setupFirebaseListeners();
-
-  // UI更新
-  showMainScreen();
-
-  // ホストの場合、タイマーを開始
-  if (state.isHost) {
-    startHostTimer();
-  }
-
-  showNotification(state.isHost ? `ルーム ${state.roomId} を作成しました` : `ルーム ${state.roomId} に参加しました`);
-  
-  // URLパラメータ更新（リロードしても戻れるように）
-  const newUrl = window.location.protocol + "//" + window.location.host + window.location.pathname + '?room=' + state.roomId;
-  window.history.pushState({path:newUrl},'',newUrl);
-}
-
-function setupFirebaseListeners() {
-  // 参加者の監視
-  state.roomRef.child('participants').on('value', (snapshot) => {
-    state.participants.clear();
-    snapshot.forEach((child) => {
-      state.participants.set(child.key, child.val());
-    });
-    updateParticipantList();
-    
-    // 休憩中なら、新しい参加者に接続を試みるなどの処理が可能
-    if (state.isBreak && state.localStream) {
-      connectToNewParticipants();
-    }
-  });
-
-  // タイマーの監視
-  state.roomRef.child('timer').on('value', (snapshot) => {
-    const timer = snapshot.val();
-    if (timer) {
-      const previousIsBreak = state.isBreak;
-      
-      // ホスト以外はFirebaseの値で同期
-      if (!state.isHost) {
-        state.remainingSeconds = timer.remainingSeconds;
-        state.isPaused = timer.isPaused;
-        state.currentCycle = timer.currentCycle || 0;
-      }
-      
-      // 休憩状態は全員同期
-      state.isBreak = timer.isBreak;
-
-      updateTimerDisplay();
-      updateCycleIndicator();
-      updateCallUI();
-
-      // 休憩開始/終了を検出
-      if (!previousIsBreak && state.isBreak) {
-        showNotification('☕ 休憩タイム！通話が始まります');
-        startCall();
-      } else if (previousIsBreak && !state.isBreak) {
-        showNotification('🎯 作業タイム！集中しましょう');
-        endCall();
+      if (result.committed) {
+        return roomId;
       }
     }
-  });
 
-  // ルーム削除の監視
-  state.roomRef.on('value', (snapshot) => {
-    if (!snapshot.exists() && state.roomId) {
-      showNotification('ルームが閉じられました', true);
-      setTimeout(leaveRoom, 2000);
-    }
-  });
-}
-
-// ============================================
-// ホスト用タイマー
-// ============================================
-function startHostTimer() {
-  setInterval(() => {
-    if (state.isPaused || !state.isHost || !state.roomRef) return;
-
-    state.remainingSeconds--;
-
-    if (state.remainingSeconds <= 0) {
-      switchPhase();
-    }
-
-    // Firebaseを更新 (1秒ごと)
-    state.roomRef.child('timer').update({
-      remainingSeconds: state.remainingSeconds,
-      isBreak: state.isBreak,
-      isPaused: state.isPaused,
-      currentCycle: state.currentCycle,
-      lastUpdate: firebase.database.ServerValue.TIMESTAMP,
-    });
-
-    updateTimerDisplay();
-  }, 1000);
-}
-
-function switchPhase() {
-  const previousIsBreak = state.isBreak;
-  state.isBreak = !state.isBreak;
-  state.remainingSeconds = state.isBreak ? CONFIG.BREAK_MINUTES * 60 : CONFIG.WORK_MINUTES * 60;
-
-  if (!state.isBreak) {
-    state.currentCycle = (state.currentCycle + 1) % 4;
+    throw new Error('Failed to create unique room id');
   }
 
-  updateTimerDisplay();
-  updateCycleIndicator();
-  updateCallUI();
-
-  if (state.isBreak) {
-    showNotification('☕ 休憩タイム！通話が始まります');
-    startCall();
-  } else {
-    showNotification('🎯 作業タイム！集中しましょう');
-    endCall();
+  async function roomExists(roomId) {
+    const snap = await state.db.ref(`rooms/${roomId}`).once('value');
+    return snap.exists();
   }
-}
 
-// ============================================
-// PeerJS 通話機能 (補完部分)
-// ============================================
-async function initializePeer() {
-  return new Promise((resolve) => {
-    state.peer = new Peer(state.odId, {
-      debug: 1, // エラーを見たい場合は2か3に
+  async function enterRoom(roomId, nickname, { justCreated }) {
+    cleanupRoomOnly();
+
+    state.roomId = roomId;
+    state.nickname = nickname;
+    state.roomRef = state.db.ref(`rooms/${roomId}`);
+
+    localStorage.setItem(STORAGE_KEYS.nickname, nickname);
+
+    // 参加者登録
+    state.participantRef = state.roomRef.child(`participants/${state.uid}`);
+    await state.participantRef.set({
+      nickname,
+      joinedAt: nowServerMs(),
+      lastSeen: nowServerMs(),
+      peerId: state.uid,
+      voiceEnabled: false,
+      muted: false,
     });
+    state.participantRef.onDisconnect().remove();
 
-    state.peer.on('open', (id) => {
-      console.log('My peer ID is: ' + id);
-      resolve();
-    });
+    // リスナー
+    attachRoomListeners();
 
-    state.peer.on('call', (call) => {
-      // 着信時（休憩中なら応答）
-      if (state.isBreak && state.localStream) {
-        call.answer(state.localStream);
-        handleStream(call);
+    // Peer初期化
+    await initPeerIfNeeded();
+
+    // ハートビート
+    state.heartbeatTicker = setInterval(() => {
+      if (state.participantRef) {
+        state.participantRef.update({
+          lastSeen: nowServerMs(),
+          muted: state.isMuted,
+          voiceEnabled: state.voiceEnabled,
+        });
       }
-    });
+    }, HEARTBEAT_MS);
 
-    state.peer.on('error', (err) => {
-      console.error('Peer error:', err);
-    });
-  });
-}
+    // ホストのときだけゴミ掃除（死んだ参加者）
+    state.staleTicker = setInterval(pruneStaleParticipantsIfHost, 15_000);
 
-async function startCall() {
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    state.localStream = stream;
-    
-    // ビジュアライザー起動
-    setupAudioVisualizer(stream);
+    // UI ticker
+    state.uiTicker = setInterval(tickUI, 250);
 
-    // ミュート状態を反映
-    setMute(state.isMuted);
+    showScreen('room');
+    updateUrlWithRoom(roomId);
 
-    // 他の参加者に発信
-    connectToNewParticipants();
-    
-    showNotification('マイクが有効になりました');
-  } catch (err) {
-    console.error('Mic access error:', err);
-    showNotification('マイクへのアクセスが拒否されました', true);
+    els.roomTitle.textContent = `Room ${roomId}`;
+    els.workMinInput.value = Math.round(state.settings.workSec / 60);
+    els.breakMinInput.value = Math.round(state.settings.breakSec / 60);
+
+    toast(justCreated ? `ルーム ${roomId} を作成` : `ルーム ${roomId} に参加`);
   }
-}
 
-function connectToNewParticipants() {
-  state.participants.forEach((data, pId) => {
-    // 自分以外、かつまだ接続していない相手に発信
-    if (pId !== state.odId && !state.connections.has(pId)) {
-      if (state.localStream) {
-        const call = state.peer.call(pId, state.localStream);
-        if (call) {
-          handleStream(call);
+  function attachRoomListeners() {
+    // 参加者
+    onDb(state.roomRef.child('participants'), 'value', (snap) => {
+      const map = new Map();
+      snap.forEach((child) => {
+        map.set(child.key, child.val());
+      });
+      state.participants = map;
+      renderParticipants();
+
+      // ホスト不在時の引き継ぎ
+      claimHostIfNeeded();
+    });
+
+    // メタ情報
+    onDb(state.roomRef.child('meta'), 'value', (snap) => {
+      const meta = snap.val() || {};
+      state.hostId = meta.hostId || null;
+      state.isHost = state.hostId === state.uid;
+      updateRoleUI();
+
+      // hostIdが消えた場合に備えて
+      claimHostIfNeeded();
+    });
+
+    // 設定
+    onDb(state.roomRef.child('settings'), 'value', (snap) => {
+      const s = snap.val();
+      if (!s) return;
+
+      state.settings.workSec = clampInt(s.workSec, 5 * 60, 90 * 60, DEFAULT_SETTINGS.workSec);
+      state.settings.breakSec = clampInt(s.breakSec, 60, 30 * 60, DEFAULT_SETTINGS.breakSec);
+
+      els.workMinInput.value = Math.round(state.settings.workSec / 60);
+      els.breakMinInput.value = Math.round(state.settings.breakSec / 60);
+
+      updateTimerUiOnly();
+    });
+
+    // タイマー
+    onDb(state.roomRef.child('timer'), 'value', (snap) => {
+      const t = snap.val();
+      if (!t) return;
+
+      const prevPhase = state.timer.phase;
+      state.timer = {
+        phase: t.phase === 'break' ? 'break' : 'work',
+        paused: !!t.paused,
+        pausedRemaining: Number(t.pausedRemaining ?? phaseDurationSec(t.phase || 'work')),
+        phaseStartAt: Number(t.phaseStartAt || nowServerMs()),
+        cycle: Number(t.cycle || 0),
+        version: Number(t.version || 0),
+      };
+
+      updateTimerUiOnly();
+
+      if (prevPhase !== state.timer.phase) {
+        if (state.timer.phase === 'break') {
+          toast('☕ 休憩開始。話すなら今。');
+        } else {
+          toast('🎯 作業開始。口より手を動かす時間。');
+          // 作業フェーズに入ったら通話を切る
+          if (state.voiceEnabled) {
+            disableVoice(false);
+          }
         }
       }
-    }
-  });
-}
+    });
 
-function handleStream(call) {
-  const peerId = call.peer;
-  state.connections.set(peerId, call);
+    // ルーム削除や強制退出
+    onDb(state.roomRef, 'value', (snap) => {
+      if (!snap.exists()) {
+        toast('ルームが閉じられました。', true);
+        leaveRoom();
+        return;
+      }
 
-  call.on('stream', (remoteStream) => {
-    // 音声を再生するためのAudio要素作成（画面には表示しない）
-    let audio = document.getElementById(`audio-${peerId}`);
-    if (!audio) {
-      audio = document.createElement('audio');
-      audio.id = `audio-${peerId}`;
-      audio.autoplay = true;
-      document.body.appendChild(audio);
-    }
-    audio.srcObject = remoteStream;
-    
-    // UI反映（話している人を光らせるなど）
-    // ※今回は簡易実装のため省略。本格的にはAudioContextで音量検知が必要
-  });
-
-  call.on('close', () => {
-    cleanupConnection(peerId);
-  });
-  
-  call.on('error', () => {
-    cleanupConnection(peerId);
-  });
-}
-
-function cleanupConnection(peerId) {
-  if (state.connections.has(peerId)) {
-    state.connections.get(peerId).close();
-    state.connections.delete(peerId);
-  }
-  const audio = document.getElementById(`audio-${peerId}`);
-  if (audio) audio.remove();
-}
-
-function endCall() {
-  if (state.localStream) {
-    state.localStream.getTracks().forEach(track => track.stop());
-    state.localStream = null;
-  }
-  
-  // 全通話を切断
-  state.connections.forEach(call => call.close());
-  state.connections.clear();
-  
-  // Audio要素の掃除
-  document.querySelectorAll('audio').forEach(el => el.remove());
-  
-  // ビジュアライザー停止
-  if (state.audioContext) {
-    state.audioContext.close();
-    state.audioContext = null;
-  }
-}
-
-function toggleMute() {
-  state.isMuted = !state.isMuted;
-  setMute(state.isMuted);
-  
-  const btn = document.getElementById('muteBtn');
-  if (state.isMuted) {
-    btn.innerHTML = '🔇 ミュート中';
-    btn.classList.add('active');
-  } else {
-    btn.innerHTML = '🎤 ミュート';
-    btn.classList.remove('active');
-  }
-}
-
-function setMute(muted) {
-  if (state.localStream) {
-    state.localStream.getAudioTracks().forEach(track => {
-      track.enabled = !muted;
+      if (state.roomId && !state.participants.has(state.uid)) {
+        // 自分の参加者レコードが消えたら離脱
+        toast('ルームから切断されました。', true);
+        leaveRoom();
+      }
     });
   }
-}
 
-// ============================================
-// オーディオビジュアライザー (簡易版)
-// ============================================
-function setupAudioVisualizer(stream) {
-  if (!window.AudioContext && !window.webkitAudioContext) return;
-  
-  const AudioContext = window.AudioContext || window.webkitAudioContext;
-  state.audioContext = new AudioContext();
-  const src = state.audioContext.createMediaStreamSource(stream);
-  state.analyser = state.audioContext.createAnalyser();
-  state.analyser.fftSize = 64; // バーの本数に合わせて調整
-  src.connect(state.analyser);
-  
-  const bufferLength = state.analyser.frequencyBinCount;
-  const dataArray = new Uint8Array(bufferLength);
-  const bars = document.querySelectorAll('.audio-bar');
-  
-  function renderFrame() {
-    if (!state.localStream || !state.audioContext) return;
-    
-    requestAnimationFrame(renderFrame);
-    state.analyser.getByteFrequencyData(dataArray);
-    
-    // バーの高さに反映 (簡易的)
-    bars.forEach((bar, index) => {
-      // 低音域から適当にピックアップ
-      const value = dataArray[index + 2] || 0;
-      const height = Math.max(4, value / 4); // 最大高さを調整
-      bar.style.height = `${height}px`;
-    });
-  }
-  
-  renderFrame();
-}
+  async function claimHostIfNeeded() {
+    if (!state.roomRef || !state.participants.size) return;
 
-// ============================================
-// その他の操作
-// ============================================
-function copyRoomCode() {
-  if (state.roomId) {
-    navigator.clipboard.writeText(state.roomId).then(() => {
-      showNotification('ルームIDをコピーしました');
-    });
-  }
-}
+    const hostAlive = state.hostId && state.participants.has(state.hostId);
+    if (hostAlive) return;
 
-function leaveRoom() {
-  // 接続解除
-  endCall();
-  if (state.peer) state.peer.destroy();
-  if (state.roomRef) state.roomRef.off(); // リスナー解除
-  
-  // ページリロードでリセット
-  window.location.href = window.location.pathname;
-}
+    const oldest = getOldestParticipantId();
+    if (oldest !== state.uid) return;
 
-// ============================================
-// 設定モーダル
-// ============================================
-function toggleSettings() {
-  const modal = document.getElementById('settingsModal');
-  modal.classList.toggle('active');
-}
-
-function saveSettings() {
-  const work = parseInt(document.getElementById('workMinutes').value);
-  const brk = parseInt(document.getElementById('breakMinutes').value);
-  
-  if (work > 0 && brk > 0) {
-    CONFIG.WORK_MINUTES = work;
-    CONFIG.BREAK_MINUTES = brk;
-    
-    // ホストならDBにも反映
-    if (state.isHost && state.roomRef) {
-      state.roomRef.child('settings').update({
-        workMinutes: work,
-        breakMinutes: brk
+    try {
+      await state.roomRef.child('meta/hostId').transaction((current) => {
+        if (!current || !state.participants.has(current)) {
+          return state.uid;
+        }
+        return current;
       });
-      // タイマーリセット
-      state.remainingSeconds = state.isBreak ? brk * 60 : work * 60;
-      state.roomRef.child('timer').update({
-        remainingSeconds: state.remainingSeconds
+    } catch (err) {
+      console.error('host claim failed', err);
+    }
+  }
+
+  function getOldestParticipantId() {
+    let oldestId = null;
+    let oldestJoinedAt = Number.POSITIVE_INFINITY;
+
+    state.participants.forEach((p, id) => {
+      const joinedAt = Number(p?.joinedAt || nowServerMs());
+      if (joinedAt < oldestJoinedAt) {
+        oldestJoinedAt = joinedAt;
+        oldestId = id;
+      }
+    });
+
+    return oldestId;
+  }
+
+  async function pruneStaleParticipantsIfHost() {
+    if (!state.isHost || !state.roomRef) return;
+
+    const now = nowServerMs();
+    const updates = {};
+
+    state.participants.forEach((p, id) => {
+      if (id === state.uid) return;
+      const lastSeen = Number(p?.lastSeen || 0);
+      if (now - lastSeen > STALE_MS) {
+        updates[`participants/${id}`] = null;
+      }
+    });
+
+    if (Object.keys(updates).length > 0) {
+      try {
+        await state.roomRef.update(updates);
+      } catch (err) {
+        console.error('stale prune failed', err);
+      }
+    }
+  }
+
+  // -----------------------------
+  // Timer logic
+  // -----------------------------
+  function tickUI() {
+    updateTimerUiOnly();
+
+    // ホストは残り0でフェーズ切替
+    if (state.isHost && !state.timer.paused && !state.isSwitchingPhase) {
+      const remaining = calcRemainingSec();
+      if (remaining <= 0) {
+        advancePhase();
+      }
+    }
+  }
+
+  function phaseDurationSec(phase = state.timer.phase) {
+    return phase === 'break' ? state.settings.breakSec : state.settings.workSec;
+  }
+
+  function calcRemainingSec() {
+    const duration = phaseDurationSec(state.timer.phase);
+
+    if (state.timer.paused) {
+      return clampInt(state.timer.pausedRemaining, 0, duration, duration);
+    }
+
+    const elapsed = (nowServerMs() - Number(state.timer.phaseStartAt)) / 1000;
+    return Math.max(0, Math.ceil(duration - elapsed));
+  }
+
+  async function handleStartPause() {
+    if (!state.isHost || !state.roomRef) {
+      toast('ホストだけが開始/停止できます。民主主義に見えてここは違う。', true);
+      return;
+    }
+
+    const duration = phaseDurationSec(state.timer.phase);
+
+    if (state.timer.paused) {
+      const remaining = clampInt(state.timer.pausedRemaining, 1, duration, duration);
+      const startAt = nowServerMs() - (duration - remaining) * 1000;
+      await writeTimer({
+        paused: false,
+        phaseStartAt: startAt,
+        version: (state.timer.version || 0) + 1,
+      });
+    } else {
+      const remaining = calcRemainingSec();
+      await writeTimer({
+        paused: true,
+        pausedRemaining: remaining,
+        version: (state.timer.version || 0) + 1,
       });
     }
-    
-    updateTimerDisplay();
-    toggleSettings();
   }
-}
 
-// モーダル外クリックで閉じる
-document.getElementById('settingsModal').addEventListener('click', (e) => {
-  if (e.target.id === 'settingsModal') {
-    toggleSettings();
+  async function handleSkip() {
+    if (!state.isHost) {
+      toast('次へ進めるのはホストだけ。さすがに全員が押したら地獄。', true);
+      return;
+    }
+    await advancePhase();
   }
-});
+
+  async function advancePhase() {
+    if (state.isSwitchingPhase) return;
+    state.isSwitchingPhase = true;
+
+    try {
+      const currentPhase = state.timer.phase;
+      const nextPhase = currentPhase === 'work' ? 'break' : 'work';
+      const nextDuration = phaseDurationSec(nextPhase);
+      const nextCycle = currentPhase === 'work' ? Number(state.timer.cycle || 0) + 1 : Number(state.timer.cycle || 0);
+
+      await writeTimer({
+        phase: nextPhase,
+        paused: false,
+        pausedRemaining: nextDuration,
+        phaseStartAt: nowServerMs(),
+        cycle: nextCycle,
+        version: (state.timer.version || 0) + 1,
+      });
+    } finally {
+      state.isSwitchingPhase = false;
+    }
+  }
+
+  async function writeTimer(patch) {
+    if (!state.roomRef) return;
+    await state.roomRef.child('timer').update(patch);
+  }
+
+  // -----------------------------
+  // Voice (PeerJS)
+  // -----------------------------
+  async function initPeerIfNeeded() {
+    if (state.peer) return;
+
+    await new Promise((resolve) => {
+      const peer = new Peer(state.uid, { debug: 1 });
+      state.peer = peer;
+
+      peer.on('open', () => {
+        state.peerReady = true;
+        resolve();
+      });
+
+      peer.on('call', (call) => {
+        if (!canUseVoiceNow() || !state.localStream) {
+          try {
+            call.close();
+          } catch {
+            // noop
+          }
+          return;
+        }
+
+        call.answer(state.localStream);
+        attachRemoteCall(call);
+      });
+
+      peer.on('error', (err) => {
+        console.error('Peer error:', err);
+        toast('通話接続でエラー。通信環境が暴れてる。', true);
+      });
+    });
+  }
+
+  function canUseVoiceNow() {
+    return state.timer.phase === 'break';
+  }
+
+  async function toggleVoice() {
+    if (state.voiceEnabled) {
+      disableVoice(true);
+      return;
+    }
+
+    if (!canUseVoiceNow()) {
+      toast('休憩中だけ通話できます。作業中は静かに勉強。', true);
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          noiseSuppression: true,
+          echoCancellation: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+
+      state.localStream = stream;
+      state.voiceEnabled = true;
+      state.isMuted = false;
+
+      startMicVisualizer(stream);
+      await syncParticipantVoiceState();
+      connectToVoicePeers();
+
+      updateVoiceUiOnly();
+      toast('マイクを有効化。休憩雑談どうぞ。');
+    } catch (err) {
+      console.error(err);
+      toast('マイク取得に失敗。ブラウザ権限を確認して。', true);
+    }
+  }
+
+  async function disableVoice(showToast) {
+    state.voiceEnabled = false;
+    state.isMuted = false;
+
+    if (state.localStream) {
+      state.localStream.getTracks().forEach((t) => t.stop());
+      state.localStream = null;
+    }
+
+    stopMicVisualizer();
+
+    // 接続を全部切る
+    state.remoteCalls.forEach((call, peerId) => {
+      try {
+        call.close();
+      } catch {
+        // noop
+      }
+      cleanupRemoteAudio(peerId);
+    });
+    state.remoteCalls.clear();
+
+    await syncParticipantVoiceState();
+    updateVoiceUiOnly();
+
+    if (showToast) toast('マイクをOFFにしました。');
+  }
+
+  function connectToVoicePeers() {
+    if (!state.peer || !state.peerReady || !state.localStream || !state.voiceEnabled) return;
+
+    state.participants.forEach((p, id) => {
+      if (id === state.uid) return;
+      if (state.remoteCalls.has(id)) return;
+
+      // 相手がまだvoiceEnabledでなくても、休憩中なら後でincomingで繋がるので問題なし。
+      const call = state.peer.call(id, state.localStream, {
+        metadata: {
+          roomId: state.roomId,
+        },
+      });
+
+      if (call) {
+        attachRemoteCall(call);
+      }
+    });
+  }
+
+  function attachRemoteCall(call) {
+    const peerId = call.peer;
+    state.remoteCalls.set(peerId, call);
+
+    call.on('stream', (remoteStream) => {
+      const audioId = `remote-audio-${peerId}`;
+      let audioEl = document.getElementById(audioId);
+      if (!audioEl) {
+        audioEl = document.createElement('audio');
+        audioEl.id = audioId;
+        audioEl.autoplay = true;
+        audioEl.playsInline = true;
+        audioEl.style.display = 'none';
+        document.body.appendChild(audioEl);
+      }
+      audioEl.srcObject = remoteStream;
+    });
+
+    const onCloseOrError = () => {
+      cleanupRemoteAudio(peerId);
+      state.remoteCalls.delete(peerId);
+    };
+
+    call.on('close', onCloseOrError);
+    call.on('error', onCloseOrError);
+  }
+
+  function cleanupRemoteAudio(peerId) {
+    const el = document.getElementById(`remote-audio-${peerId}`);
+    if (el) el.remove();
+  }
+
+  async function toggleMute() {
+    if (!state.localStream || !state.voiceEnabled) return;
+
+    state.isMuted = !state.isMuted;
+    state.localStream.getAudioTracks().forEach((t) => {
+      t.enabled = !state.isMuted;
+    });
+
+    await syncParticipantVoiceState();
+    updateVoiceUiOnly();
+  }
+
+  async function syncParticipantVoiceState() {
+    if (!state.participantRef) return;
+    await state.participantRef.update({
+      voiceEnabled: state.voiceEnabled,
+      muted: state.isMuted,
+      lastSeen: nowServerMs(),
+    });
+  }
+
+  // -----------------------------
+  // Mic visualizer
+  // -----------------------------
+  function startMicVisualizer(stream) {
+    stopMicVisualizer();
+
+    if (!window.AudioContext && !window.webkitAudioContext) return;
+
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    state.audioCtx = new Ctx();
+
+    const src = state.audioCtx.createMediaStreamSource(stream);
+    state.analyser = state.audioCtx.createAnalyser();
+    state.analyser.fftSize = 64;
+    src.connect(state.analyser);
+
+    const data = new Uint8Array(state.analyser.frequencyBinCount);
+    const bars = [...els.micBars.querySelectorAll('span')];
+
+    const animate = () => {
+      if (!state.analyser || !state.voiceEnabled) return;
+      state.micAnimationFrame = requestAnimationFrame(animate);
+      state.analyser.getByteFrequencyData(data);
+
+      bars.forEach((bar, i) => {
+        const v = data[i + 1] || 0;
+        const h = Math.max(6, Math.floor(v / 5));
+        bar.style.height = `${h}px`;
+      });
+    };
+
+    animate();
+  }
+
+  function stopMicVisualizer() {
+    if (state.micAnimationFrame) {
+      cancelAnimationFrame(state.micAnimationFrame);
+      state.micAnimationFrame = null;
+    }
+
+    if (state.audioCtx) {
+      state.audioCtx.close().catch(() => {});
+      state.audioCtx = null;
+      state.analyser = null;
+    }
+
+    [...els.micBars.querySelectorAll('span')].forEach((b) => {
+      b.style.height = '6px';
+    });
+  }
+
+  // -----------------------------
+  // Settings modal
+  // -----------------------------
+  function openSettingsModal() {
+    if (!state.roomId) return;
+
+    els.workMinInput.value = Math.round(state.settings.workSec / 60);
+    els.breakMinInput.value = Math.round(state.settings.breakSec / 60);
+
+    els.settingsModal.classList.remove('hidden');
+    els.settingsModal.setAttribute('aria-hidden', 'false');
+  }
+
+  function closeSettingsModal() {
+    els.settingsModal.classList.add('hidden');
+    els.settingsModal.setAttribute('aria-hidden', 'true');
+  }
+
+  async function saveSettings() {
+    if (!state.roomRef || !state.isHost) {
+      toast('設定変更はホストのみ。', true);
+      closeSettingsModal();
+      return;
+    }
+
+    const workMin = clampInt(Number(els.workMinInput.value), 5, 90, 25);
+    const breakMin = clampInt(Number(els.breakMinInput.value), 1, 30, 5);
+
+    const workSec = workMin * 60;
+    const breakSec = breakMin * 60;
+
+    try {
+      await state.roomRef.child('settings').update({ workSec, breakSec });
+      await writeTimer({
+        phase: 'work',
+        paused: true,
+        pausedRemaining: workSec,
+        phaseStartAt: nowServerMs(),
+        cycle: 0,
+        version: (state.timer.version || 0) + 1,
+      });
+
+      toast('設定を保存。タイマーを作業フェーズ先頭にリセット。');
+      closeSettingsModal();
+    } catch (err) {
+      console.error(err);
+      toast('設定保存に失敗。', true);
+    }
+  }
+
+  // -----------------------------
+  // UI rendering
+  // -----------------------------
+  function updateRoleUI() {
+    const hostOnly = state.isHost;
+
+    els.startPauseBtn.disabled = !hostOnly;
+    els.skipBtn.disabled = !hostOnly;
+
+    if (!hostOnly) {
+      els.startPauseBtn.textContent = state.timer.paused ? '開始（ホスト専用）' : '停止（ホスト専用）';
+    } else {
+      els.startPauseBtn.textContent = state.timer.paused ? '開始' : '一時停止';
+    }
+
+    if (state.timer.paused) {
+      els.startPauseBtn.textContent = hostOnly ? '開始' : '開始（ホスト専用）';
+    } else {
+      els.startPauseBtn.textContent = hostOnly ? '一時停止' : '停止（ホスト専用）';
+    }
+  }
+
+  function updateTimerUiOnly() {
+    const remaining = calcRemainingSec();
+    const duration = phaseDurationSec(state.timer.phase);
+    const progress = duration > 0 ? (duration - remaining) / duration : 0;
+    const pct = Math.min(1, Math.max(0, progress)) * 100;
+
+    els.timerDisplay.textContent = secToMMSS(remaining);
+    els.timerLabel.textContent = state.timer.phase === 'break' ? '休憩タイム' : '集中タイム';
+    els.cycleText.textContent = String(state.timer.cycle || 0);
+
+    els.phaseBadge.className = `badge ${state.timer.phase}`;
+    els.phaseBadge.textContent = state.timer.phase === 'break' ? '☕ 休憩中' : '🎯 作業中';
+
+    const ringColor = state.timer.phase === 'break' ? 'var(--break)' : 'var(--work)';
+    els.ring.style.background = `conic-gradient(${ringColor} ${pct}%, rgba(159, 176, 207, 0.14) ${pct}%)`;
+
+    updateRoleUI();
+    updateVoiceUiOnly();
+  }
+
+  function updateVoiceUiOnly() {
+    const breakNow = canUseVoiceNow();
+    const enabled = state.voiceEnabled;
+
+    els.voiceToggleBtn.disabled = !breakNow;
+    els.muteBtn.disabled = !enabled;
+
+    if (!breakNow) {
+      els.voiceHelp.textContent = '作業中は通話できません。休憩開始で開放されます。';
+      els.voiceStatePill.textContent = 'LOCK';
+    } else {
+      els.voiceHelp.textContent = '休憩中です。必要ならマイクをONに。';
+      els.voiceStatePill.textContent = enabled ? (state.isMuted ? 'MUTED' : 'LIVE') : 'OFF';
+    }
+
+    els.voiceToggleBtn.textContent = enabled ? 'マイクOFF' : 'マイクON';
+    els.muteBtn.textContent = state.isMuted ? 'ミュート解除' : 'ミュート';
+  }
+
+  function renderParticipants() {
+    els.participantList.innerHTML = '';
+
+    const arr = [...state.participants.entries()].sort((a, b) => {
+      const aj = Number(a[1]?.joinedAt || 0);
+      const bj = Number(b[1]?.joinedAt || 0);
+      return aj - bj;
+    });
+
+    arr.forEach(([id, p]) => {
+      const li = document.createElement('li');
+      li.className = 'participant';
+
+      const left = document.createElement('div');
+      left.className = 'name';
+      left.textContent = p.nickname || '名無し';
+
+      const right = document.createElement('div');
+      right.className = 'meta';
+
+      if (id === state.hostId) {
+        right.appendChild(tag('HOST', 'host'));
+      }
+      if (id === state.uid) {
+        right.appendChild(tag('YOU'));
+      }
+      if (p.voiceEnabled) {
+        right.appendChild(tag(p.muted ? 'VOICE:MUTED' : 'VOICE:ON', 'voice'));
+      }
+
+      li.appendChild(left);
+      li.appendChild(right);
+      els.participantList.appendChild(li);
+    });
+
+    els.participantCount.textContent = `${arr.length}人`;
+
+    // 休憩中 & 自分がvoice on なら新規参加者へ接続を試みる
+    if (canUseVoiceNow() && state.voiceEnabled) {
+      connectToVoicePeers();
+    }
+  }
+
+  function tag(text, cls = '') {
+    const s = document.createElement('span');
+    s.className = `tag ${cls}`.trim();
+    s.textContent = text;
+    return s;
+  }
+
+  function showScreen(which) {
+    if (els.setupScreen) els.setupScreen.classList.add('hidden');
+    if (els.lobbyScreen) els.lobbyScreen.classList.add('hidden');
+    if (els.roomScreen) els.roomScreen.classList.add('hidden');
+
+    if (which === 'setup' && els.setupScreen) els.setupScreen.classList.remove('hidden');
+    if (which === 'lobby' && els.lobbyScreen) els.lobbyScreen.classList.remove('hidden');
+    if (which === 'room' && els.roomScreen) els.roomScreen.classList.remove('hidden');
+  }
+
+  function toast(msg, isError = false) {
+    els.toast.textContent = msg;
+    els.toast.style.borderColor = isError
+      ? 'rgba(248, 113, 113, 0.6)'
+      : 'rgba(94, 234, 212, 0.35)';
+    els.toast.style.color = isError ? '#fecaca' : '#d1fae5';
+    els.toast.classList.add('show');
+
+    clearTimeout(toast._timer);
+    toast._timer = setTimeout(() => {
+      els.toast.classList.remove('show');
+    }, 2200);
+  }
+
+  // -----------------------------
+  // Room leave / cleanup
+  // -----------------------------
+  async function leaveRoom() {
+    if (!state.roomId) {
+      showScreen('lobby');
+      return;
+    }
+
+    try {
+      // ホストなら次のホストを指名
+      if (state.isHost && state.roomRef) {
+        const nextHost = [...state.participants.keys()].find((id) => id !== state.uid) || null;
+        if (nextHost) {
+          await state.roomRef.child('meta/hostId').set(nextHost);
+        } else {
+          // 自分しかいないならルーム削除
+          await state.roomRef.remove();
+        }
+      }
+    } catch (err) {
+      console.error(err);
+    }
+
+    cleanupAll();
+    clearRoomFromUrl();
+    showScreen('lobby');
+    toast('ルームを退出しました。');
+  }
+
+  function cleanupAll() {
+    cleanupRoomOnly();
+
+    state.roomId = null;
+    state.hostId = null;
+    state.isHost = false;
+    state.participants = new Map();
+
+    renderParticipants();
+    updateRoleUI();
+  }
+
+  function cleanupRoomOnly() {
+    // voice
+    disableVoice(false).catch(() => {});
+
+    if (state.peer) {
+      try {
+        state.peer.destroy();
+      } catch {
+        // noop
+      }
+      state.peer = null;
+      state.peerReady = false;
+    }
+
+    // participant cleanup
+    if (state.participantRef) {
+      state.participantRef.remove().catch(() => {});
+      state.participantRef = null;
+    }
+
+    // timers
+    if (state.uiTicker) clearInterval(state.uiTicker);
+    if (state.heartbeatTicker) clearInterval(state.heartbeatTicker);
+    if (state.staleTicker) clearInterval(state.staleTicker);
+
+    state.uiTicker = null;
+    state.heartbeatTicker = null;
+    state.staleTicker = null;
+
+    // Room DB listeners only
+    state.roomDbListeners.forEach((off) => off());
+    state.roomDbListeners = [];
+
+    // Room refs
+    state.roomRef = null;
+  }
+
+  // -----------------------------
+  // Clipboard / URL
+  // -----------------------------
+  async function copyRoomCode() {
+    if (!state.roomId) return;
+    try {
+      await navigator.clipboard.writeText(state.roomId);
+      toast('ルームコードをコピー。');
+    } catch {
+      toast('コピー失敗。ブラウザ権限を確認して。', true);
+    }
+  }
+
+  async function copyInviteLink() {
+    if (!state.roomId) return;
+    const url = `${location.origin}${location.pathname}?room=${state.roomId}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast('招待リンクをコピー。');
+    } catch {
+      toast('コピー失敗。', true);
+    }
+  }
+
+  function updateUrlWithRoom(roomId) {
+    const url = new URL(location.href);
+    url.searchParams.set('room', roomId);
+    history.replaceState({}, '', url.toString());
+  }
+
+  function clearRoomFromUrl() {
+    const url = new URL(location.href);
+    url.searchParams.delete('room');
+    history.replaceState({}, '', url.toString());
+  }
+
+  function getRoomFromQuery() {
+    const url = new URL(location.href);
+    return normalizeRoomCode(url.searchParams.get('room') || '');
+  }
+
+  // -----------------------------
+  // Utility
+  // -----------------------------
+  function on(el, event, handler) {
+    if (el) el.addEventListener(event, handler);
+  }
+
+  function onDb(ref, event, handler, scope = 'room') {
+    ref.on(event, handler);
+    const off = () => ref.off(event, handler);
+    if (scope === 'global') {
+      state.globalDbListeners.push(off);
+    } else {
+      state.roomDbListeners.push(off);
+    }
+  }
+
+  function disableLobbyButtons(disabled) {
+    els.joinBtn.disabled = disabled;
+    els.createBtn.disabled = disabled;
+  }
+
+  function sanitizeNickname(raw) {
+    const s = String(raw || '').trim().replace(/\s+/g, ' ');
+    if (s.length < 2) return '';
+    return s.slice(0, 16);
+  }
+
+  function normalizeRoomCode(v) {
+    return String(v || '')
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, '')
+      .slice(0, 8);
+  }
+
+  function generateRoomCode() {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let out = '';
+    for (let i = 0; i < ROOM_CODE_LEN; i += 1) {
+      out += alphabet[Math.floor(Math.random() * alphabet.length)];
+    }
+    return out;
+  }
+
+  function secToMMSS(sec) {
+    const s = Math.max(0, Math.floor(sec));
+    const mm = Math.floor(s / 60);
+    const ss = s % 60;
+    return `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+  }
+
+  function clampInt(value, min, max, fallback) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    const i = Math.round(n);
+    return Math.min(max, Math.max(min, i));
+  }
+
+  function getOrCreateUid() {
+    const existing = localStorage.getItem(STORAGE_KEYS.uid);
+    if (existing) return existing;
+
+    const uid = `u_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
+    localStorage.setItem(STORAGE_KEYS.uid, uid);
+    return uid;
+  }
+
+  function nowServerMs() {
+    return Date.now() + state.serverOffsetMs;
+  }
+})();
