@@ -754,12 +754,23 @@
   }
 
   function connectToVoicePeers() {
-    if (!state.peer || !state.peerReady || !state.localStream || !state.voiceEnabled) return;
+    if (!state.peer || !state.peerReady || !state.localStream || !state.voiceEnabled) {
+      console.log('[Voice] connectToVoicePeers skipped:', {
+        peer: !!state.peer,
+        peerReady: state.peerReady,
+        localStream: !!state.localStream,
+        voiceEnabled: state.voiceEnabled,
+      });
+      return;
+    }
+
+    console.log('[Voice] Connecting to peers. Participants:', [...state.participants.keys()]);
 
     state.participants.forEach((p, id) => {
       if (id === state.uid) return;
       if (state.remoteCalls.has(id)) return;
 
+      console.log('[Voice] Calling peer:', id);
       // 相手がまだvoiceEnabledでなくても、休憩中なら後でincomingで繋がるので問題なし。
       const call = state.peer.call(id, state.localStream, {
         metadata: {
@@ -768,7 +779,10 @@
       });
 
       if (call) {
+        console.log('[Voice] Call initiated to:', id);
         attachRemoteCall(call);
+      } else {
+        console.log('[Voice] Call failed to initiate for:', id);
       }
     });
   }
@@ -778,6 +792,9 @@
     state.remoteCalls.set(peerId, call);
 
     call.on('stream', (remoteStream) => {
+      console.log('[Voice] Received stream from:', peerId);
+      console.log('[Voice] Audio tracks:', remoteStream.getAudioTracks().length);
+      
       const audioId = `remote-audio-${peerId}`;
       let audioEl = document.getElementById(audioId);
       if (!audioEl) {
@@ -789,6 +806,15 @@
         document.body.appendChild(audioEl);
       }
       audioEl.srcObject = remoteStream;
+      
+      // 明示的に再生を開始（autoplayがブロックされる場合の対策）
+      audioEl.play()
+        .then(() => {
+          console.log('[Voice] Audio playback started for:', peerId);
+        })
+        .catch((err) => {
+          console.error('[Voice] Audio play failed:', peerId, err);
+        });
     });
 
     const onCloseOrError = () => {
